@@ -1,6 +1,7 @@
 package models
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -36,6 +37,7 @@ type Target struct {
 	CpuUtil    float64 `json:"cpu_util" gorm:"-"`
 	Arch       string  `json:"arch" gorm:"-"`
 	RemoteAddr string  `json:"remote_addr" gorm:"-"`
+	GroupIds   []int64 `json:"group_ids" gorm:"-"`
 }
 
 func (t *Target) TableName() string {
@@ -101,7 +103,8 @@ type BuildTargetWhereOption func(session *gorm.DB) *gorm.DB
 func BuildTargetWhereWithBgids(bgids []int64) BuildTargetWhereOption {
 	return func(session *gorm.DB) *gorm.DB {
 		if len(bgids) > 0 {
-			session = session.Where("group_id in (?)", bgids)
+			session = session.Joins("join target_busi_group on target.ident = "+
+				"target_busi_group.target_ident").Where("target_busi_group.group_id in (?)", bgids)
 		}
 		return session
 	}
@@ -456,4 +459,76 @@ func IdentsFilter(ctx *ctx.Context, idents []string, where string, args ...inter
 
 func (m *Target) UpdateFieldsMap(ctx *ctx.Context, fields map[string]interface{}) error {
 	return DB(ctx).Model(m).Updates(fields).Error
+}
+
+func (m *Target) FillGroupIds(tgList []*TargetBusiGroup) {
+	m.GroupIds = make([]int64, 0, len(tgList))
+	for _, tg := range tgList {
+		m.GroupIds = append(m.GroupIds, tg.GroupId)
+	}
+}
+
+func MigrateBg(ctx *ctx.Context, bgLabelKey string) {
+	// 1. 判断是否已经完成迁移
+	var cnt int64
+	if err := DB(ctx).Model(&TargetBusiGroup{}).Count(&cnt).Error; err != nil {
+		fmt.Println("Failed to count target_busi_group, err:", err)
+		return
+	}
+	if cnt > 0 {
+		fmt.Println("Migration has been completed.")
+		return
+	}
+
+	DoMigrateBg(ctx, bgLabelKey)
+}
+
+func DoMigrateBg(ctx *ctx.Context, bgLabelKey string) error {
+	// 2. 获取全量 target
+	targets, err := TargetGetsAll(ctx)
+	if err != nil {
+		fmt.Println("Failed to get target, err:", err)
+		return err
+	}
+
+	// 3. 获取全量 busi_group
+	bgs, err := BusiGroupGetAll(ctx)
+	if err != nil {
+		fmt.Println("Failed to get bg, err:", err)
+		return err
+	}
+
+	bgById := make(map[int64]*BusiGroup, len(bgs))
+	for _, bg := range bgs {
+		bgById[bg.Id] = bg
+	}
+
+	// 4. 如果某 busi_group 有 label，将其存至对应的 target tags 中
+	for _, t := range targets {
+		if t.GroupId == 0 {
+			continue
+		}
+		err := DB(ctx).Transaction(func(tx *gorm.DB) error {
+			// 4.1 将 group_id 迁移至关联表
+			if err := TargetBindBgids(ctx, []string{t.Ident}, []int64{t.GroupId}); err != nil {
+				return err
+			}
+			if err := TargetUpdateBgid(ctx, []string{t.Ident}, 0, false); err != nil {
+				return err
+			}
+
+			// 4.2 判断该机器是否需要新增 tag
+			if bg, ok := bgById[t.GroupId]; !ok || bg.LabelEnable == 0 ||
+				strings.Contains(t.Tags, bgLabelKey+"=") {
+				return nil
+			} else {
+				return t.AddTags(ctx, []string{bgLabelKey + "=" + bg.LabelValue})
+			}
+		})
+		if err != nil {
+			fmt.Println("Failed to migrate bg, err:", err)
+			continue
+		}
+	}
+	return nil
 }
